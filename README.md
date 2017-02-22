@@ -1,6 +1,6 @@
 rpi-midi-ble
 ============
-git
+
 This project allows the [Raspberry Pi 3](https://www.raspberrypi.org/products/raspberry-pi-3-model-b/) to be used as an USB-MIDI over BLE-MIDI ([Bluetooth Low Energy MIDI](https://developer.apple.com/bluetooth/Apple-Bluetooth-Low-Energy-MIDI-Specification.pdf)) device.
 
 ![rpi-midi-ble](https://raw.githubusercontent.com/oxesoft/rpi-midi-ble/master/rpi-midi-ble.jpg)
