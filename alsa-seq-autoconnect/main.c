@@ -22,40 +22,53 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <stdlib.h>
 #include <stdbool.h>
 #include <signal.h>
+#include <memory.h>
 #include <alsa/asoundlib.h>
 
-#define EMPTY_VALUE 0xFF
+#define MAX_SENDERS 16
+#define APP_NAME "alsa-seq-autoconnect"
 static char *dest_name = "BLE-MIDI Device";
 static bool stop       =  false;
-static bool connected  =  false;
-static snd_seq_connect_t ports;
+typedef struct snd_seq_connect_ports {
+    bool           senders_connected[MAX_SENDERS];
+    bool           senders_found    [MAX_SENDERS];
+    snd_seq_addr_t senders          [MAX_SENDERS];
+    bool           dest_found;
+    snd_seq_addr_t dest;
+} snd_seq_connect_ports_t;
+static snd_seq_connect_ports_t ports;
 
 static void sighandler(int sig)
 {
     stop = true;
 }
 
-static void connect_ports(snd_seq_t *seq)
+static void connect_ports(snd_seq_t *seq, int index)
 {
     snd_seq_port_subscribe_t *subs;
 
-    if (connected == true)
+    if (index >= MAX_SENDERS)
+    {
+        return;
+    }
+
+    if (ports.senders_connected[index] == true)
     {
         return;
     }
 
     printf("Connecting %d,%d to %d,%d\n",
-        ports.sender.client,
-        ports.sender.port,
+        ports.senders[index].client,
+        ports.senders[index].port,
         ports.dest.client,
         ports.dest.port);
 
     snd_seq_port_subscribe_alloca(&subs);
-    snd_seq_port_subscribe_set_sender(subs, &ports.sender);
+    snd_seq_port_subscribe_set_sender(subs, &ports.senders[index]);
     snd_seq_port_subscribe_set_dest(subs, &ports.dest);
     snd_seq_subscribe_port(seq, subs);
 
-    connected = true;
+    ports.senders_connected[index] == true;
 }
 
 static bool verify_port(snd_seq_t *seq, int client, int port)
@@ -66,33 +79,65 @@ static bool verify_port(snd_seq_t *seq, int client, int port)
     const char* pname = snd_seq_port_info_get_name(pinfo);
     unsigned int caps = snd_seq_port_info_get_capability(pinfo);
     unsigned int type = snd_seq_port_info_get_type(pinfo);
+    int i;
 
     if (strcmp(pname, dest_name) == 0)
     {
         printf("Found destination port \"%s\"\n", pname);
         ports.dest.client = client;
         ports.dest.port   = port;
+        ports.dest_found  = true;
     }
     else if (caps & SND_SEQ_PORT_CAP_READ      &&
              caps & SND_SEQ_PORT_CAP_SUBS_READ &&
-             type & SND_SEQ_PORT_TYPE_HARDWARE &&
-             (ports.sender.client == EMPTY_VALUE ||
-              ports.sender.port   == EMPTY_VALUE))
+             type & SND_SEQ_PORT_TYPE_HARDWARE)
     {
-        printf("Found source port \"%s\"\n", pname);
-        ports.sender.client = client;
-        ports.sender.port   = port;
+        bool already_used = false;
+        for (i = 0; i < MAX_SENDERS; i++)
+        {
+            if (ports.senders[i].client == client &&
+                ports.senders[i].port   == port   &&
+                ports.senders_found[i]  == true)
+            {
+                already_used = true;
+                break;
+            }
+        }
+
+        if (already_used == false)
+        {
+            int available_index = -1;
+            for (i = 0; i < MAX_SENDERS; i++)
+            {
+                if (ports.senders_found[i] == false)
+                {
+                    available_index = i;
+                    break;
+                }
+            }
+            if (available_index != -1)
+            {
+                printf("Found source port \"%s\"\n", pname);
+                ports.senders[available_index].client    = client;
+                ports.senders[available_index].port      = port;
+                ports.senders_found[available_index]     = true;
+                ports.senders_connected[available_index] = false;
+            }
+        }
     }
 
-    if (ports.sender.client == EMPTY_VALUE ||
-        ports.sender.port   == EMPTY_VALUE ||
-        ports.dest.client   == EMPTY_VALUE ||
-        ports.dest.port     == EMPTY_VALUE)
+    if (ports.dest_found == false)
     {
         return false;
     }
 
-    connect_ports(seq);
+    for (i = 0; i < MAX_SENDERS; i++)
+    {
+        if (ports.senders_found[i] == true && ports.senders_connected[i] == false)
+        {
+            connect_ports(seq, i);
+        }
+    }
 
     return true;
 }
@@ -125,11 +170,9 @@ int main(int argc, char *argv[])
     snd_seq_t *seq;
     struct pollfd *pfds;
     int npfds;
+    int i;
 
-    ports.sender.client = EMPTY_VALUE;
-    ports.sender.port   = EMPTY_VALUE;
-    ports.dest.client   = EMPTY_VALUE;
-    ports.dest.port     = EMPTY_VALUE;
+    memset(&ports, 0, sizeof(ports));
 
     signal(SIGINT, sighandler);
     signal(SIGTERM, sighandler);
@@ -141,27 +184,34 @@ int main(int argc, char *argv[])
         goto _err;
     }
 
-    err = snd_seq_create_simple_port(seq, "alsa-seq-autoconnect",
+    err = snd_seq_set_client_name(seq, APP_NAME);
+    if (err < 0)
+    {
+        fprintf(stderr, "Error naming port: %s\n", snd_strerror(err));
+        goto _err_seq_close;
+    }
+
+    err = snd_seq_create_simple_port(seq, APP_NAME,
                      SND_SEQ_PORT_CAP_WRITE |
                      SND_SEQ_PORT_CAP_SUBS_WRITE,
                      SND_SEQ_PORT_TYPE_APPLICATION);
     if (err < 0)
     {
-        fprintf(stderr, "Error creating port\n");
+        fprintf(stderr, "Error creating port: %s\n", snd_strerror(err));
         goto _err_seq_close;
     }
 
     err = snd_seq_nonblock(seq, 1);
     if (err < 0)
     {
-        fprintf(stderr, "Error setting non block mode\n");
+        fprintf(stderr, "Error setting non block mode: %s\n", snd_strerror(err));
         goto _err_seq_close;
     }
 
     err = snd_seq_connect_from(seq, 0, 0, 1);
     if (err < 0)
     {
-        fprintf(stderr, "Cannot connect from announce port: %s", snd_strerror(err));
+        fprintf(stderr, "Cannot connect from announce port: %s\n", snd_strerror(err));
         goto _err_seq_close;
     }
 
@@ -196,21 +246,31 @@ int main(int argc, char *argv[])
                         verify_port(seq, event->data.addr.client, event->data.addr.port);
                         break;
                     case SND_SEQ_EVENT_PORT_EXIT:
-                        if (event->data.addr.client == ports.sender.client &&
-                            event->data.addr.port   == ports.sender.port)
-                        {
-                            printf("Exited source port\n");
-                            ports.sender.client = EMPTY_VALUE;
-                            ports.sender.port   = EMPTY_VALUE;
-                            connected = false;
-                        }
-                        else if (event->data.addr.client == ports.dest.client &&
-                                 event->data.addr.port   == ports.dest.port)
+                        if (event->data.addr.client == ports.dest.client &&
+                            event->data.addr.port   == ports.dest.port   &&
+                            ports.dest_found == true)
                         {
                             printf("Exited destination port\n");
-                            ports.dest.client = EMPTY_VALUE;
-                            ports.dest.port   = EMPTY_VALUE;
-                            connected = false;
+                            ports.dest_found = false;
+                            for (i = 0; i < MAX_SENDERS; i++)
+                            {
+                                ports.senders_connected[i] = false;
+                            }
+                        }
+                        else
+                        {
+                            for (i = 0; i < MAX_SENDERS; i++)
+                            {
+                                if (event->data.addr.client == ports.senders[i].client &&
+                                    event->data.addr.port   == ports.senders[i].port   &&
+                                    ports.senders_found[i] == true)
+                                {
+                                    printf("Exited source port\n");
+                                    ports.senders_found[i]     = false;
+                                    ports.senders_connected[i] = false;
+                                    break;
+                                }
+                            }
                         }
                         break;
                 }
